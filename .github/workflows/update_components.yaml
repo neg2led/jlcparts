@@ -4,8 +4,6 @@ on:
     branches:
       - "neggles"
   workflow_dispatch:
-#  schedule:
-#    - cron: '0 3 * * *'
 
 jobs:
   build_and_update:
@@ -14,55 +12,90 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v2
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip nodejs npm wget zip unzip libreoffice
           sudo pip3 install requests click xlsx2csv
-      - name: Build frontend
+
+      - name: Install jlcparts package and create build dir
         run: |
-          cd web
+          sudo pip3 install -e .
+          mkdir -p ./build
+
+      - name: Build Web Frontend
+        working-directory: './web'
+        run: |
           if [ "$GITHUB_REPOSITORY" = 'yaqwsx/jlcparts-dev' ]; then
             export BASEURL=https://jlcparts-dev.honzamrazek.cz
           else
-            export BASEURL=https://${{ github.repository_owner }}.github.io/jlcparts
+            export BASEURL="https://${{ github.repository_owner }}.github.io/jlcparts"
           fi
           npm install --silent
           NODE_ENV=production PUBLIC_URL=${BASEURL} npm run build
           if [ $GITHUB_REPOSITORY = 'yaqwsx/jlcparts-dev' ]; then
             echo 'jlcparts-dev.honzamrazek.cz' > build/CNAME
           fi
-      - name: Update database
-        run: |
-          sudo pip3 install -e .
-          wget -q https://${{ github.repository_owner }}.github.io/jlcparts/data/cache.zip && unzip cache.zip
-          if [ ! -f cache.json ]; then
-            wget -q https://yaqwsx.github.io/jlcparts/data/cache.zip && unzip cache.zip
-          fi
-          wget -q -O parts.xls https://jlcpcb.com/componentSearch/uploadComponentInfo
 
-          # It is hard to read the original xls file, hence we convert it into xlsx
-          libreoffice --headless --convert-to xlsx parts.xls
-          # There are multiple lists, so join them
-          xlsx2csv -a parts.xlsx parts
-          sheets=(parts/*)
-          head -n 1 "${sheets[1]}" > parts.csv
-          for f in parts/*; do
-            tail -n +2 "$f" >> parts.csv
-          done
-          jlcparts getlibrary --cache cache.json --age 10000 --newLogFile newComponents.txt parts.csv jlcdata.json
-          cp jlcdata.json cache.json
-          jlcparts buildtables jlcdata.json web/build/data
-          zip web/build/data/cache.zip cache.json
-          wget -q -O web/build/data/changelog.json https://${{ github.repository_owner }}.github.io/jlcparts/data/changelog.json
-          if [! -f web/build/data/changelog.json ]; then
-            wget -q -O web/build/data/changelog.json https://yaqwsx.github.io/jlcparts/data/changelog.json
+      - name: Retrieve DB cache and extract
+        working-directory: "./build"
+        run: |
+          wget -q "https://${{ github.repository_owner }}.github.io/jlcparts/data/cache.zip" && unzip cache.zip && rm cache.zip
+          if [ ! -f cache.json ]; then
+            wget -q "https://yaqwsx.github.io/jlcparts/data/cache.zip" && unzip cache.zip && rm cache.zip
           fi
-          jlcparts updatechangelog newComponents.txt web/build/data/changelog.json
-      - name: Tar artifact # Artifact are case insensitive, this is workaround
+
+      - name: Pull JLCPCB data file and pre-process
+        working-directory: "./build"
+        run: |
+          # Grab parts.xls file
+          wget -q -O parts.xls "https://jlcpcb.com/componentSearch/uploadComponentInfo"
+
+          # Convert XLS to XLSX for ease of parsing
+          libreoffice --headless --convert-to xlsx parts.xls && rm parts.xls
+
+          # Dump XLSX sheets to multiple CSV files, then join them together
+          xlsx2csv -a parts.xlsx partcsv
+
+          # Get the CSV file list, extract the header from the first one
+          csvfiles=(partcsv/*)
+          head -n1 "${csvfiles[1]}" > parts.csv
+          for csv in partcsv/*; do
+            tail -n+2 "${csv}" >> parts.csv
+          done
+          rm -f partcsv/*
+
+      - name: Do jlcparts database update
+        run: |
+          # drop into build dir
+          pushd build
+          # Run the python script
+          jlcparts getlibrary --cache cache.json --age 10000 --newLogFile newComponents.txt parts.csv jlcdata.json
+          # copy the updated JSON file over the old cache
+          cp jlcdata.json cache.json
+          popd
+
+          # Build the tables for the webapp
+          jlcparts buildtables build/jlcdata.json web/build/data
+
+          # Copy the updated cache JSON into the webapp
+          zip web/build/data/cache.zip build/cache.json
+
+      - name: Do jlcparts changelog update
+        run: |
+          # grab the changelog file from existing deployment
+          wget -q -O web/build/data/changelog.json "https://${{ github.repository_owner }}.github.io/jlcparts/data/changelog.json"
+          if [ ! -f web/build/data/changelog.json ]; then
+            wget -q -O web/build/data/changelog.json "https://yaqwsx.github.io/jlcparts/data/changelog.json"
+          fi
+          jlcparts updatechangelog build/newComponents.txt web/build/data/changelog.json
+
+      - name: Create webapp deployment artifact # Artifact are case insensitive, this is workaround
         run: tar -czf web_build.tar.gz web/build/
-      - name: Upload artifact
+
+      - name: Upload deployment artifact
         uses: actions/upload-artifact@v2
         with:
           name: web_build
@@ -77,12 +110,15 @@ jobs:
     steps:
       - name: Checkout # Required for GH-pages deployment
         uses: actions/checkout@v2
-      - name: "Download web"
+
+      - name: Download deployment artifact
         uses: actions/download-artifact@v2
         with:
           name: web_build
-      - name: Untar artifact
+
+      - name: Untar deployment artifact
         run: tar -xzf web_build.tar.gz
+
       - name: Deploy to GH Pages
         uses: JamesIves/github-pages-deploy-action@4.1.0
         with:
